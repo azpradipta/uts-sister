@@ -1,0 +1,71 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker Compose — Pub-Sub Log Aggregator (Bonus +10%)
+# ─────────────────────────────────────────────────────────────────────────────
+# Dua service terpisah dengan jaringan internal Docker:
+#   1. aggregator  — FastAPI server (menerima & memproses event)
+#   2. publisher   — Script Python (mengirim event ke aggregator)
+#
+# Tidak menggunakan layanan eksternal; semua komunikasi lokal di dalam network.
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  # Jaringan internal default Compose — tidak expose ke luar Docker
+  aggregator-net:
+    driver: bridge
+    internal: false   # false agar publisher bisa pull image Python; set true jika sudah build
+
+volumes:
+  # Volume persistent untuk dedup store SQLite
+  # Tetap ada setelah container dihentikan → restart tetap ingat event yang sudah diproses
+  dedup-data:
+    driver: local
+
+services:
+  # ── Service 1: Aggregator (FastAPI) ────────────────────────────────────────
+  aggregator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: uts-aggregator
+    ports:
+      - "8080:8080"          # Expose ke host untuk testing manual / video demo
+    environment:
+      DEDUP_DB_PATH: /app/data/dedup.db
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      LOG_LEVEL: "INFO"
+      QUEUE_MAXSIZE: "10000"
+    volumes:
+      - dedup-data:/app/data  # Mount volume persistent
+    networks:
+      - aggregator-net
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── Service 2: Publisher (Python script) ───────────────────────────────────
+  publisher:
+    build:
+      context: .
+      dockerfile: publisher/Dockerfile
+    container_name: uts-publisher
+    environment:
+      AGGREGATOR_URL: "http://aggregator:8080"   # Gunakan nama service Docker internal
+      TOTAL_EVENTS: "5000"
+      DUPLICATE_RATE: "0.25"                     # 25% duplikasi
+      BATCH_SIZE: "100"
+      BATCH_DELAY: "0.05"
+    networks:
+      - aggregator-net
+    depends_on:
+      aggregator:
+        condition: service_healthy  # Tunggu aggregator siap sebelum publisher mulai
+    restart: "no"                   # Publisher berjalan sekali lalu selesai
