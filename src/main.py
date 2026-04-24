@@ -102,7 +102,43 @@ app = FastAPI(
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@app.post("/publish", status_code=202, summary="Publish event ke aggregator")
+@app.post(
+    "/publish",
+    status_code=202,
+    summary="Publish event ke aggregator",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {"type": "object"},
+                    "examples": {
+                        "single_event": {
+                            "summary": "Single Event",
+                            "value": {
+                                "topic": "demo-live",
+                                "event_id": "demo-event-001",
+                                "timestamp": "2024-01-15T10:00:00Z",
+                                "source": "live-demo",
+                                "payload": {"pesan": "ini event pertama"},
+                            },
+                        },
+                        "batch_object": {
+                            "summary": "Batch (object)",
+                            "value": {
+                                "events": [
+                                    {"topic": "orders", "event_id": "ord-001", "timestamp": "2024-01-15T10:00:00Z", "source": "order-svc", "payload": {"amount": 50000}},
+                                    {"topic": "orders", "event_id": "ord-002", "timestamp": "2024-01-15T10:01:00Z", "source": "order-svc", "payload": {"amount": 75000}},
+                                    {"topic": "orders", "event_id": "ord-001", "timestamp": "2024-01-15T10:00:00Z", "source": "order-svc", "payload": {"amount": 50000}},
+                                ]
+                            },
+                        },
+                    },
+                }
+            },
+        }
+    },
+)
 async def publish(request: Request) -> Dict[str, Any]:
     """
     Terima satu atau banyak event dari publisher.
