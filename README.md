@@ -2,24 +2,51 @@
 
 > **UTS Sistem Terdistribusi** — Idempotent Consumer dengan Deduplication berbasis SQLite
 
-🚀 **[Link Video Demo (YouTube)](https://www.youtube.com/watch?v=jWL2_1Iz4fc)**
-📄 **[Link Laporan (Google Drive)](https://drive.google.com/file/d/1i5hx1zeduF-25tU4VfDTil6M6ckfT6KL/view?usp=drive_link)** — [`report.md`](report.md)*
+> 🚀 **[Tonton Video Demo di YouTube](https://www.youtube.com/watch?v=jWL2_1Iz4fc)**
+> 📄 **[Baca Laporan Lengkap PDF (Google Drive)](https://drive.google.com/file/d/1i5hx1zeduF-25tU4VfDTil6M6ckfT6KL/view?usp=drive_link)** — *Versi teks tersedia di [`report.md`](report.md)*
 
-## Arsitektur
+## Arsitektur Sistem
 
 ```
-Publisher  ──POST /publish──▶  asyncio.Queue  ──▶  IdempotentConsumer
-                                                           │
-                                                           ▼
-                              GET /events & /stats  ◀── SQLite DedupStore
+Publisher Service (Docker container)
+        │
+        │  POST /publish  (single / batch array / batch object)
+        │  Format: { topic, event_id, timestamp, source, payload }
+        ▼
+┌─────────────────────────────────────────────────────┐
+│              FastAPI Aggregator (Uvicorn)            │
+│                                                     │
+│  ┌──────────────┐   increment_received()            │
+│  │  HTTP Layer  │──────────────────────────────┐    │
+│  │  POST /pub   │──► asyncio.Queue (max 10.000)│    │
+│  └──────────────┘                              │    │
+│                                                ▼    │
+│                              ┌──────────────────────┐│
+│                              │  IdempotentConsumer  ││
+│                              │  (asyncio background ││
+│                              │   task)              ││
+│                              └──────────┬───────────┘│
+│                                         │ store_event()
+│                                         ▼            │
+│                              ┌──────────────────────┐│
+│                              │   SQLite DedupStore  ││
+│                              │   WAL mode, ACID     ││
+│                              │   PRIMARY KEY        ││
+│                              │   (topic, event_id)  ││
+│                              └──────────────────────┘│
+│                                                     │
+│  GET /events?topic=...  ◄── DedupStore.get_events() │
+│  GET /stats             ◄── DedupStore.get_stats()  │
+│  GET /health            ◄── queue.qsize()           │
+└─────────────────────────────────────────────────────┘
 ```
 
 | Komponen | Teknologi | Peran |
 |---|---|---|
-| API Server | FastAPI + Uvicorn | Menerima event dari publisher |
-| Queue | `asyncio.Queue` | Buffer in-memory publisher→consumer |
-| Consumer | `IdempotentConsumer` | Proses event, cek duplikat |
-| Dedup Store | SQLite (WAL mode) | Persistent storage, PRIMARY KEY dedup |
+| **HTTP Layer** | FastAPI + Uvicorn | Menerima event, validasi Pydantic, antre ke Queue |
+| **Queue** | `asyncio.Queue` | Buffer in-memory memisahkan penerimaan dari pemrosesan |
+| **Consumer** | `IdempotentConsumer` | Background task memproses event asinkron dari Queue |
+| **Dedup Store** | SQLite (WAL mode) | Persistent storage, `PRIMARY KEY` menolak duplikat otomatis |
 
 ---
 
