@@ -2,6 +2,9 @@
 
 > **UTS Sistem Terdistribusi** — Idempotent Consumer dengan Deduplication berbasis SQLite
 
+🚀 **[Link Video Demo (YouTube)](https://www.youtube.com/watch?v=jWL2_1Iz4fc)**
+📄 **[Link Laporan (Google Drive)](https://drive.google.com/file/d/1i5hx1zeduF-25tU4VfDTil6M6ckfT6KL/view?usp=drive_link)** — [`report.md`](report.md)*
+
 ## Arsitektur
 
 ```

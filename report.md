@@ -469,6 +469,302 @@ pytest tests/ -v
 
 ---
 
+## Ringkasan Sistem dan Arsitektur
+
+### Deskripsi Singkat
+
+**Pub-Sub Log Aggregator** adalah layanan berbasis Python yang menerima *event* dari satu atau lebih publisher melalui REST API, memproses event tersebut secara asinkron melalui antrian in-memory, dan menyimpan hanya event yang unik ke dalam database SQLite yang persisten. Sistem menjamin bahwa setiap event dengan kombinasi `(topic, event_id)` yang sama hanya diproses **tepat satu kali**, meskipun dikirim berkali-kali oleh publisher.
+
+### Diagram Alur Sederhana
+
+```
+┌──────────────────┐        HTTP POST /publish
+│  Publisher       │ ──────────────────────────────────────────────────────┐
+│  (Docker svc)    │  { topic, event_id, timestamp, source, payload }      │
+│  5.000 event     │                                                        │
+│  25% duplikat    │                                                        │
+└──────────────────┘                                                        │
+                                                                            ▼
+                                                           ┌────────────────────────┐
+                                                           │    HTTP Layer          │
+                                                           │    FastAPI / Uvicorn   │
+                                                           │    202 Accepted        │
+                                                           └────────────┬───────────┘
+                                                                        │ put_nowait()
+                                                                        ▼
+                                                           ┌────────────────────────┐
+                                                           │   asyncio.Queue        │
+                                                           │   (in-memory buffer)   │
+                                                           │   max 10.000 item      │
+                                                           └────────────┬───────────┘
+                                                                        │ get() setiap event
+                                                                        ▼
+                                                           ┌────────────────────────┐
+                                                           │  IdempotentConsumer    │
+                                                           │  (background task)     │
+                                                           │  asyncio.to_thread()   │
+                                                           └────────────┬───────────┘
+                                                                        │ store_event()
+                                              ┌─────────────────────────▼─────────────────┐
+                                              │         SQLite DedupStore                 │
+                                              │                                           │
+                                              │  INSERT → PRIMARY KEY (topic, event_id)  │
+                                              │  ✅ Unik  → simpan, unique_processed++    │
+                                              │  ❌ Duplikat → buang, duplicate_dropped++ │
+                                              │                                           │
+                                              │  WAL mode | threading.Lock() | persistent│
+                                              └───────────────────────────────────────────┘
+                                                        ▲              ▲
+                                              GET /events?topic=    GET /stats
+```
+
+### Komponen Utama
+
+| Komponen | File | Peran |
+|---|---|---|
+| **HTTP Layer** | `src/main.py` | Menerima event, validasi Pydantic, memasukkan ke Queue |
+| **asyncio.Queue** | `src/main.py` | Buffer in-memory, decoupling ingestion dari processing |
+| **IdempotentConsumer** | `src/consumer.py` | Background task, membaca Queue, memanggil DedupStore |
+| **DedupStore** | `src/dedup_store.py` | SQLite, PRIMARY KEY dedup, statistik persisten |
+| **Models** | `src/models.py` | Pydantic Event/EventBatch, validasi topic & timestamp |
+| **Publisher** | `publisher/publisher.py` | Simulasi at-least-once, batch HTTP, health check polling |
+
+---
+
+## Keputusan Desain Detail
+
+### 1. Idempotency
+
+**Definisi yang diimplementasikan:** Sebuah operasi disebut *idempotent* jika menjalankannya satu kali atau berkali-kali menghasilkan efek yang identik. Dalam sistem ini, "mengirim event yang sama N kali" harus menghasilkan state akhir yang sama dengan "mengirim event tersebut satu kali".
+
+**Mekanisme:**
+- Kunci idempotency adalah kombinasi **`(topic, event_id)`** — bukan hanya `event_id`
+- `DedupStore.store_event()` menggunakan `INSERT` dengan `PRIMARY KEY (topic, event_id)`
+- Jika event sudah ada → SQLite melempar `IntegrityError` secara **atomik**
+- Tidak ada window race condition karena tidak menggunakan pola SELECT-lalu-INSERT
+
+```python
+try:
+    conn.execute("INSERT INTO processed_events (...) VALUES (...)")
+    # Berhasil → event unik
+    return True
+except sqlite3.IntegrityError:
+    # PRIMARY KEY violation → duplikat, tidak ada efek samping
+    return False
+```
+
+**Mengapa tidak pakai SELECT dulu?** Pola SELECT-kemudian-INSERT rentan *time-of-check-to-time-of-use (TOCTOU) race condition* — dua thread bisa sama-sama melihat "belum ada" lalu keduanya INSERT. `PRIMARY KEY` constraint menghilangkan race condition ini di level database engine.
+
+---
+
+### 2. Dedup Store
+
+**Pilihan teknologi: SQLite**
+
+SQLite dipilih sebagai dedup store karena:
+
+| Kriteria | SQLite | Alternatif (Redis, file JSON) |
+|---|---|---|
+| **Persistent** | ✅ File di disk | Redis: perlu konfigurasi AOF/RDB |
+| **Tanpa server eksternal** | ✅ Embedded | Redis: butuh process terpisah |
+| **ACID transactions** | ✅ Native | File JSON: tidak ada atomicity |
+| **PRIMARY KEY constraint** | ✅ Native | File JSON: harus implementasi manual |
+| **Docker volume** | ✅ Mount langsung | Sama |
+| **Concurrency** | ✅ WAL + Lock | Redis: lebih baik tapi overkill |
+
+**Konfigurasi SQLite yang digunakan:**
+```sql
+PRAGMA journal_mode = WAL;       -- Write-Ahead Logging: concurrency lebih baik
+PRAGMA synchronous = NORMAL;     -- Keseimbangan durability vs performa
+```
+
+**WAL (Write-Ahead Logging):** Dalam mode WAL, write tidak langsung mengubah file database utama — ditulis ke file WAL terpisah terlebih dahulu. Ini memungkinkan reader tidak terblokir oleh writer, meningkatkan throughput concurrent read (GET /events, GET /stats) saat consumer sedang menulis.
+
+**Thread-safety:** `threading.Lock()` digunakan untuk serialisasi akses karena `asyncio.to_thread()` menjalankan operasi SQLite di thread pool. SQLite dengan mode WAL mendukung *multiple reader, single writer* — Lock memastikan hanya satu writer aktif pada satu waktu.
+
+**Skema tabel:**
+```sql
+CREATE TABLE processed_events (
+    topic        TEXT NOT NULL,
+    event_id     TEXT NOT NULL,
+    timestamp    TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    payload      TEXT NOT NULL DEFAULT '{}',
+    processed_at TEXT NOT NULL,
+    PRIMARY KEY (topic, event_id)   -- kunci dedup
+);
+CREATE INDEX idx_topic ON processed_events(topic);  -- optimasi GET /events?topic=
+
+CREATE TABLE stats (
+    key   TEXT PRIMARY KEY,         -- 'received' | 'unique_processed' | 'duplicate_dropped'
+    value INTEGER NOT NULL DEFAULT 0
+);
+```
+
+---
+
+### 3. Ordering
+
+**Keputusan: Partial ordering (FIFO within queue), total ordering tidak diterapkan**
+
+Dalam sistem ini, `asyncio.Queue` menjamin **FIFO ordering** — event yang masuk lebih dulu diproses lebih dulu dalam satu instance aggregator. Namun **total ordering** lintas topik tidak diterapkan dan memang tidak diperlukan, karena:
+
+1. **Independence antar topik:** Event `orders` dan `payments` tidak memiliki causal dependency. Urutan relatif keduanya tidak mempengaruhi kebenaran hasil aggregasi.
+2. **Aggregation semantics:** Tujuan sistem adalah mengumpulkan event unik, bukan mengeksekusi state machine yang urutan-sensitif.
+3. **Cost-benefit:** Implementasi total ordering memerlukan *logical clock* (Lamport clock) atau *vector clock* — overhead signifikan tanpa manfaat nyata untuk use case ini.
+
+**Apa yang dijamin:**
+- Event dari publisher yang sama dengan batch yang sama → diproses berurutan (FIFO)
+- `timestamp` (ISO 8601, di-generate publisher) tersimpan dan dapat digunakan downstream untuk reordering jika diperlukan
+- `processed_at` (waktu consumer memproses) tersedia di setiap event di database
+
+**Keterbatasan yang diterima:**
+- *Clock skew* antar publisher dapat menyebabkan event dengan `timestamp` lebih lama tiba lebih akhir
+- Event dari publisher berbeda dapat tiba out-of-order — diterima sebagai trade-off yang wajar untuk log aggregation
+
+---
+
+### 4. Retry dan Fault Tolerance
+
+**Strategi retry di publisher:**
+
+Publisher menggunakan *health check polling* sebelum mengirim event:
+```python
+def wait_for_aggregator(url, max_retries=30, delay=2.0):
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = httpx.get(f"{url}/health", timeout=5.0)
+            if resp.status_code == 200:
+                return  # aggregator siap
+        except httpx.RequestError:
+            pass
+        time.sleep(delay)
+    sys.exit(1)  # gagal setelah max_retries
+```
+
+**Simulasi at-least-once delivery:**
+Publisher secara sengaja mengirim 25% event yang `event_id`-nya sudah pernah dikirim sebelumnya, merepresentasikan skenario retry nyata (timeout, network fluke, atau duplicate push dari message broker upstream).
+
+**Respons terhadap queue penuh (HTTP 503):**
+```python
+except asyncio.QueueFull:
+    raise HTTPException(
+        status_code=503,
+        detail=f"Queue penuh ({queue.maxsize} item). Berhasil di-queue: {queued}/{total}. Coba lagi."
+    )
+```
+Publisher yang menerima 503 seharusnya mengimplementasikan *exponential backoff* sebelum retry — sinyal backpressure yang eksplisit.
+
+**Toleransi crash container:**
+- Event yang sudah di-`commit` ke SQLite sebelum crash → **aman**, WAL menjamin durability
+- Event yang masih di `asyncio.Queue` (belum di-consume) saat crash → **hilang**, namun publisher dapat mengirim ulang (at-least-once)
+- Setelah restart, DedupStore dari SQLite yang sama akan mengenali event yang sudah pernah diproses → tidak ada reprocessing
+
+---
+
+## Analisis Performa dan Metrik
+
+### Desain Pipeline dan Dampak Performa
+
+Sistem menggunakan **pipeline dua tahap** yang memisahkan ingestion dari processing:
+
+```
+Tahap 1: Ingestion (HTTP Handler)
+  POST /publish → validasi Pydantic → queue.put_nowait() → return 202
+  Waktu: ~1–5ms per request (non-blocking, tidak menunggu SQLite)
+
+Tahap 2: Processing (Background Consumer)
+  queue.get() → asyncio.to_thread(store_event) → SQLite INSERT/IntegrityError
+  Waktu: ~10–30ms per event (sequential, terikat threading.Lock)
+```
+
+Pemisahan ini berarti **HTTP handler tetap responsif** meskipun SQLite sedang menulis. Publisher tidak perlu menunggu database selesai — cukup event masuk queue, langsung dapat `202 Accepted`.
+
+### Metrik yang Diukur
+
+#### Throughput DedupStore (Stress Test)
+
+Diukur di `tests/test_stress.py` — 5.000 event langsung ke DedupStore tanpa HTTP overhead:
+
+| Parameter | Nilai |
+|---|---|
+| Total event | 5.000 |
+| Event unik | 3.750 (75%) |
+| Event duplikat | 1.250 (25%) |
+| Batas waktu | < 120 detik |
+| Throughput (estimasi) | ~50–200 events/sec (tergantung hardware) |
+
+> **Catatan:** Jalankan `pytest tests/test_stress.py -v -s` untuk melihat throughput aktual di mesin Anda. Hasil dicetak di output test.
+
+#### Latency End-to-End
+
+| Komponen | Estimasi Latency |
+|---|---|
+| HTTP parsing + Pydantic validation | ~1–3ms |
+| `queue.put_nowait()` | < 0.1ms |
+| `queue.get()` di consumer | < 0.1ms |
+| `asyncio.to_thread()` context switch | ~0.5ms |
+| SQLite `INSERT` (WAL mode) | ~5–20ms |
+| **Total end-to-end** | **~7–25ms per event** |
+
+Latency antara event diterima di `POST /publish` hingga tersedia di `GET /events` tergantung backlog queue — saat queue kosong, latency minimal. Saat banyak event menumpuk, latency bertambah linier dengan `queue_size`.
+
+#### Duplicate Rate
+
+Tersedia secara real-time di `GET /stats`:
+
+```json
+{
+  "received": 5000,
+  "unique_processed": 3750,
+  "duplicate_dropped": 1250,
+  "duplicate_rate_pct": 25.0
+}
+```
+
+Formula kalkulasi di `src/main.py`:
+```python
+duplicate_rate = (duplicate_dropped / received * 100) if received > 0 else 0.0
+```
+
+**Interpretasi:**
+- `duplicate_rate_pct` ≈ 25% → normal, sesuai konfigurasi publisher
+- `duplicate_rate_pct` > 50% → publisher terlalu agresif retry atau ada network issue
+- `duplicate_rate_pct` = 0% → publisher tidak pernah retry (potensi event loss)
+
+#### Queue Depth (Backpressure Indicator)
+
+`queue_size` di `GET /stats` dan `GET /health` adalah indikator backpressure real-time:
+
+| `queue_size` | Interpretasi | Tindakan |
+|---|---|---|
+| 0 | Consumer memproses lebih cepat dari publisher | Normal |
+| 1–1.000 | Ada backlog ringan | Monitor |
+| 1.000–9.000 | Consumer kewalahan | Pertimbangkan rate limiting publisher |
+| ≥ 10.000 | Queue penuh | Publisher mendapat HTTP 503, harus backoff |
+
+#### Availability
+
+`GET /health` endpoint dikonfigurasi sebagai HEALTHCHECK di Dockerfile dan Docker Compose:
+```
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3
+```
+
+Docker menandai container sebagai `unhealthy` setelah 3 kali gagal → Docker Compose publisher tidak akan mulai mengirim event sebelum aggregator `healthy` (`depends_on: condition: service_healthy`).
+
+### Bottleneck dan Optimasi Potensial
+
+| Bottleneck | Penyebab | Solusi Potensial |
+|---|---|---|
+| SQLite sequential write | `threading.Lock()` serialisasi semua write | Batch INSERT dalam satu transaksi |
+| Single consumer | Satu goroutine memproses event | Beberapa consumer worker paralel |
+| In-memory queue | Data hilang saat crash | Persistent queue (Redis Streams, SQLite queue table) |
+| SQLite write lock | WAL tetap single-writer | Upgrade ke PostgreSQL untuk throughput tinggi |
+
+Untuk skala UTS dengan 5.000 event, bottleneck di atas tidak signifikan. Sistem tetap responsif dan menyelesaikan seluruh beban dalam waktu yang wajar. Optimasi diperlukan hanya jika throughput target > ~500 events/sec secara sustained.
+
+---
+
 ## Referensi
 
 Tanenbaum, A. S., & Van Steen, M. (2007). *Distributed systems: Principles and paradigms* (2nd ed.). Prentice Hall.
